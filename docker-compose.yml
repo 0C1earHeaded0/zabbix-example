@@ -1,0 +1,264 @@
+services:
+  # ----------------------------------------------------
+  # БАЗА ДАННЫХ ДЛЯ СЕРВЕРА (PostgreSQL)
+  # ----------------------------------------------------
+  postgres-server-db:
+    image: postgres:16-alpine
+    container_name: postgres-server-db
+    restart: always
+    environment:
+      POSTGRES_DB: zabbix
+      POSTGRES_USER_FILE: /run/secrets/pg_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    secrets:
+      - pg_user
+      - pg_password
+    networks:
+      - database
+
+  # Инициализация БД Сервера
+  server-pgsql-db-init:
+    image: zabbix/zabbix-server-pgsql:ubuntu-latest
+    container_name: zabbix-server-pgsql-init
+    init: true
+    attach: true
+    read_only: true
+    restart: "no"
+    volumes:
+      - /var/lib/zabbix/dbscripts:/var/lib/zabbix/dbscripts:ro
+    command: init_db_only
+    tmpfs: /tmp
+    environment:
+      - DB_SERVER_HOST=postgres-server-db
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER_FILE=/run/secrets/pg_user
+      - POSTGRES_PASSWORD_FILE=/run/secrets/pg_password
+    secrets:
+      - pg_user
+      - pg_password
+    depends_on:
+      - postgres-server-db
+    networks:
+      database:
+        aliases:
+          - zabbix-server-pgsql-init
+
+  # Сам Сервер Zabbix
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:ubuntu-latest
+    container_name: zabbix-server
+    init: true
+    restart: "${RESTART_POLICY}"
+    attach: true
+    ports:
+      - name: zabbix-trapper
+        target: 10051
+        published: "${ZABBIX_SERVER_PORT}"
+        protocol: tcp
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /usr/lib/zabbix/alertscripts:/usr/lib/zabbix/alertscripts:ro
+      - /usr/lib/zabbix/externalscripts:/usr/lib/zabbix/externalscripts:ro
+      - /var/lib/zabbix/export:/var/lib/zabbix/export:rw
+      - /var/lib/zabbix/modules:/var/lib/zabbix/modules:ro
+      - /var/lib/zabbix/enc:/var/lib/zabbix/enc:ro
+      - /var/lib/zabbix/ssh_keys:/var/lib/zabbix/ssh_keys:ro
+      - /var/lib/zabbix/mibs:/var/lib/zabbix/mibs:ro
+    tmpfs:
+      - /tmp
+      - /var/lib/zabbix/ssl/ssl_ca_internal:mode=770,uid=1997,gid=0
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 20000
+        hard: 40000
+    deploy:
+      resources:
+        limits:
+          cpus: '0.70'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    environment:
+      - DB_SERVER_HOST=postgres-server-db
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER_FILE=/run/secrets/pg_user
+      - POSTGRES_PASSWORD_FILE=/run/secrets/pg_password
+    secrets:
+      - pg_user
+      - pg_password
+    sysctls:
+      - net.ipv4.ip_local_port_range=1024 64999   # Увеличение диапазона портов исходящих соединений почти до 64 тыс. вместо стандартных 28 тыс.
+      - net.ipv4.conf.all.accept_redirects=0      # |
+      - net.ipv4.conf.all.secure_redirects=0      # | - Защита от MITM
+      - net.ipv4.conf.all.send_redirects=0        # |
+    depends_on:
+      server-pgsql-db-init:
+        condition: service_completed_successfully
+    networks:
+      database:
+        aliases:
+          - zabbix-server
+      backend:
+        aliases:
+          - zabbix-server
+
+  # ----------------------------------------------------
+  # ВЕБ-ИНТЕРФЕЙС ZABBIX (Nginx)
+  # ----------------------------------------------------
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:ubuntu-latest
+    container_name: zabbix-web
+    restart: "${RESTART_POLICY}"
+    ports:
+      - name: zabbix-web
+        target: 8080
+        published: "${ZABBIX_WEB_PORT}"
+        protocol: tcp
+    environment:
+      - ZBX_SERVER_HOST=zabbix-server
+      - DB_SERVER_HOST=postgres-server-db
+      - DB_SERVER_PORT=5432
+      - DB_TYPE=POSTGRESQL
+      - POSTGRES_DB=zabbix
+      - POSTGRES_USER_FILE=/run/secrets/pg_user
+      - POSTGRES_PASSWORD_FILE=/run/secrets/pg_password
+      - PHP_TZ=${TZ}
+    secrets:
+      - pg_user
+      - pg_password
+    depends_on:
+      - zabbix-server
+    networks:
+      - backend
+      - database
+
+  # ----------------------------------------------------
+  # БАЗА ДАННЫХ ДЛЯ ПРОКСИ (MariaDB)
+  # ----------------------------------------------------
+  mysql-proxy-db:
+    image: mariadb:10.11
+    container_name: mysql-proxy-db
+    restart: always
+    environment:
+      MYSQL_DATABASE: zabbix_proxy
+    volumes:
+      - ./data/mysql-proxy:/var/lib/mysql
+    secrets:
+      - mysql_proxy_user
+      - mysql_proxy_password
+      - mysql_root_password
+    entrypoint: 
+      - bash
+      - -c
+      - |
+        export MYSQL_USER=$$(cat /run/secrets/mysql_proxy_user)
+        export MYSQL_PASSWORD=$$(cat /run/secrets/mysql_proxy_password)
+        export MYSQL_ROOT_PASSWORD=$$(cat /run/secrets/mysql_root_password)
+        exec docker-entrypoint.sh mysqld
+    networks:
+      - database
+
+  # Инициализация БД Прокси
+  proxy-mysql-db-init:
+    image: zabbix/zabbix-proxy-mysql:ubuntu-latest
+    container_name: zabbix-proxy-mysql-init
+    init: true
+    attach: true
+    read_only: true
+    restart: "no"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/lib/zabbix/enc:/var/lib/zabbix/enc:ro
+    command: init_db_only
+    tmpfs: /tmp
+    environment:
+      - DB_SERVER_HOST=mysql-proxy-db
+      - MYSQL_DATABASE=zabbix_proxy
+      - MYSQL_USER_FILE=/run/secrets/mysql_proxy_user
+      - MYSQL_PASSWORD_FILE=/run/secrets/mysql_proxy_password
+    secrets:
+      - mysql_proxy_user
+      - mysql_proxy_password
+    depends_on:
+      - mysql-proxy-db
+    networks:
+      database:
+        aliases:
+          - zabbix-proxy-mysql-init
+
+  # Сам Прокси Zabbix
+  zabbix-proxy:
+    image: zabbix/zabbix-proxy-mysql:ubuntu-latest
+    container_name: zabbix-proxy
+    init: true
+    restart: "${RESTART_POLICY}"
+    ports:
+      - name: zabbix-trapper
+        target: 10051
+        published: "${ZABBIX_PROXY_MYSQL_PORT}"
+        protocol: tcp
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /usr/lib/zabbix/externalscripts:/usr/lib/zabbix/externalscripts:ro
+      - /var/lib/zabbix/modules:/var/lib/zabbix/modules:ro
+      - /var/lib/zabbix/enc:/var/lib/zabbix/enc:ro
+      - /var/lib/zabbix/ssh_keys:/var/lib/zabbix/ssh_keys:ro
+      - /var/lib/zabbix/mibs:/var/lib/zabbix/mibs:ro
+    tmpfs:
+      - /tmp
+      - /var/lib/zabbix/ssl/ssl_ca_internal:mode=770,uid=1997,gid=0
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 20000
+        hard: 40000
+    deploy:
+      resources:
+        limits:
+          cpus: '0.70'
+          memory: 512M
+        reservations:
+          cpus: '0.3'
+          memory: 256M
+    environment:
+      - ZBX_SERVER_HOST=zabbix-server
+      - DB_SERVER_HOST=mysql-proxy-db
+      - MYSQL_DATABASE=zabbix_proxy
+      - MYSQL_USER_FILE=/run/secrets/mysql_proxy_user
+      - MYSQL_PASSWORD_FILE=/run/secrets/mysql_proxy_password
+    secrets:
+      - mysql_proxy_user
+      - mysql_proxy_password
+    sysctls:
+      - net.ipv4.ip_local_port_range=1024 64999   # Увеличение диапазона портов исходящих соединений почти до 64 тыс. вместо стандартных 28 тыс. 
+      - net.ipv4.conf.all.accept_redirects=0      # |
+      - net.ipv4.conf.all.secure_redirects=0      # | - Защита от MITM
+      - net.ipv4.conf.all.send_redirects=0        # |
+    depends_on:
+      proxy-mysql-db-init:
+        condition: service_completed_successfully
+      zabbix-server:
+        condition: service_started
+    networks:
+      backend:
+      database:
+
+networks:
+  database:
+  backend:
+
+secrets:
+  pg_user:
+    file: ${ENV_VARS_DIRECTORY}/pg_user.txt
+  pg_password:
+    file: ${ENV_VARS_DIRECTORY}/pg_password.txt
+  mysql_proxy_user:
+    file: ${ENV_VARS_DIRECTORY}/mysql_proxy_user.txt
+  mysql_proxy_password:
+    file: ${ENV_VARS_DIRECTORY}/mysql_proxy_password.txt
+  mysql_root_password:
+    file: ${ENV_VARS_DIRECTORY}/mysql_root_password.txt
