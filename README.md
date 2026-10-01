@@ -1,2 +1,4 @@
 # zabbix-example
-Step by step zabbix deployment
+Гайд-практика по развертыванию Zabbix в контейнере.
+
+# <a href='docs/components.md'>Компоненты</a>
